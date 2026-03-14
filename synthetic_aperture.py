@@ -15,7 +15,7 @@ def synthetic_aperture(comphase,angle_index,z_index):
     weight_syn = torch.zeros((sp.nz, sp.ny, sp.nx), device=sp.device)  # 用于记录每个频率点被填充的次数，用于后续平均
 
     u_m=torch.tensor(sp.n_medium/sp.wave_length).to(sp.device) #介质波数
-    du=min(sp.dux,sp.duy,sp.duz) #空间频率网格间距量级
+    du=5* min(sp.dux,sp.duy,sp.duz) #空间频率网格间距量级
 
     for i in range(comphase.shape[0]):
         ## 计算入射波的空间频率
