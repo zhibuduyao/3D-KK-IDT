@@ -1,80 +1,75 @@
-import cal_complex_phase as ccp
-import system_parameter as sp
 import torch
 import tifffile
+import system_parameter as sp
 
-def synthetic_aperture(comphase,angle_index,z_index):
-    """
-    comphase:复相位数组，维度为[照明角度，z轴扫描数量，图像高度，图像宽度]
-    angle_index:照明角度的索引，二维数组，维度为[照明角度数量,2],分别为与x轴和z轴的夹角，单位为度
-    z_index:z轴扫描高度的索引
-    return:合成孔径后给出折射率，三维，维度为[z轴扫描数量，图像高度，图像宽度]
-    """
+def synthetic_aperture(comphase, angle_index, z_index):
+    # 初始化复散射势傅里叶谱
+    O_syn_hat = torch.zeros((sp.nz, sp.ny, sp.nx), dtype=torch.complex64, device=sp.device)
+    weight_syn = torch.zeros((sp.nz, sp.ny, sp.nx), device=sp.device) 
 
-    O_syn_hat = torch.zeros((sp.nz, sp.ny, sp.nx), dtype=torch.complex64, device=sp.device)#初始化复散射势傅里叶谱
-    weight_syn = torch.zeros((sp.nz, sp.ny, sp.nx), device=sp.device)  # 用于记录每个频率点被填充的次数，用于后续平均
-
-    u_m=torch.tensor(sp.n_medium/sp.wave_length).to(sp.device) #介质波数
-    du=5* min(sp.dux,sp.duy,sp.duz) #空间频率网格间距量级
+    u_m = torch.tensor(sp.n_medium / sp.wave_length).to(sp.device) 
+    du =100*min(sp.dux, sp.duy, sp.duz) 
 
     for i in range(comphase.shape[0]):
-        ## 计算入射波的空间频率
+        ## 1. 计算入射波的空间频率
         theta = angle_index[i][1] * torch.pi / 180
         phi = angle_index[i][0] * torch.pi / 180
-        u_inx, u_iny =-torch.tensor(torch.sin(theta)*torch.cos(phi)/sp.wave_length).to(sp.device), -torch.tensor(torch.sin(theta)*torch.sin(phi)/sp.wave_length).to(sp.device)
-        u_inz=torch.tensor(torch.sqrt(u_m**2-u_inx**2-u_iny**2+0j).real).to(sp.device)
-        if torch.abs(u_inz)<1e-6:
-            print(f"警告⚠️：入射波接近临界角，可能导致数值不稳定，入射角度为theta={angle_index[i][1]}度, phi={angle_index[i][0]}度")
+        u_inx = -torch.tensor(torch.sin(theta) * torch.cos(phi) / sp.wave_length).to(sp.device)
+        u_iny = -torch.tensor(torch.sin(theta) * torch.sin(phi) / sp.wave_length).to(sp.device)
+        u_inz = torch.tensor(torch.sqrt(u_m**2 - u_inx**2 - u_iny**2 + 0j).real).to(sp.device)
 
         phi_s_3d = comphase[i]
-        phi_s_hat = torch.fft.fftn(phi_s_3d)
-        phi_s_hat = torch.fft.fftshift(phi_s_hat) # 将零频率分量移到频谱中心
+        phi_s_hat = torch.fft.fftshift(torch.fft.fftn(phi_s_3d))
     
-        
+        ## 2. 计算支撑区条件
+        U_prime_X = sp.UX + u_inx
+        U_prime_Y = sp.UY + u_iny
+        U_prime_Z = sp.UZ + u_inz
 
-        ## 计算u'=u+u_in,然后判断是否满足支撑区条件
-        U_prime_X=sp.UX+u_inx
-        U_prime_Y=sp.UY+u_iny
-        U_prime_Z=sp.UZ+u_inz
-
-        #支撑区条件1：位于ewald球面附近
         on_ewald = torch.abs(torch.sqrt(U_prime_X**2 + U_prime_Y**2 + U_prime_Z**2) - u_m) < du
-
-        # 支撑区条件2: 横向频率在瞳函数内
         in_pupil = (torch.sqrt(U_prime_X**2 + U_prime_Y**2) <= sp.NA_obj / sp.wave_length)
+        Mask = (on_ewald & in_pupil)
 
-        Mask = (on_ewald & in_pupil).float()
-        # print(f"照明角度theta={angle_index[i][1]}度, phi={angle_index[i][0]}度, 满足支撑区条件的频率点数量: {(Mask>0.5).sum().item()}")
+        ## 3. 改进：使用浮点坐标进行线性分配，替代 round()
+        # 计算浮点索引
+        fx = sp.UX / sp.dux + sp.nx // 2
+        fy = sp.UY / sp.duy + sp.ny // 2
+        fz = sp.UZ / sp.duz + sp.nz // 2
 
-        ## 映射复相位到复散射势
-        #计算v=u-u_in
-        VX = sp.UX
-        VY = sp.UY
-        VZ = sp.UZ
-
-        #将频率转换为索引
-        ix=torch.round(VX/sp.dux + sp.nx//2).long() 
-        iy=torch.round(VY/sp.duy + sp.ny//2).long()
-        iz=torch.round(VZ/sp.duz + sp.nz//2).long()
-        # print(ix.max(), ix.min(), iy.max(), iy.min(), iz.max(), iz.min())
-        valid_mask = (ix >= 0) & (ix < sp.nx) & (iy >= 0) & (iy < sp.ny) & (iz >= 0) & (iz < sp.nz) & (Mask > 0.5)
+        # 仅处理有效区域
+        valid_mask = (fx >= 0) & (fx < sp.nx-1) & (fy >= 0) & (fy < sp.ny-1) & (fz >= 0) & (fz < sp.nz-1) & Mask
+        
         if valid_mask.sum() == 0:
-            print(f"警告⚠️：没有有效频率点满足支撑区条件，入射角度为theta={angle_index[i][1]}度, phi={angle_index[i][0]}度")
             continue
 
-        source_values = phi_s_hat[valid_mask]*(4j*torch.pi*sp.UZ[valid_mask]) #添加因子项，后续可能需要考虑数据稳定性
-        target_z_indices = iz[valid_mask]
-        target_y_indices = iy[valid_mask]
-        target_x_indices = ix[valid_mask]
+        # 提取有效点的浮点坐标和源值
+        v_fx, v_fy, v_fz = fx[valid_mask], fy[valid_mask], fz[valid_mask]
+        source_values = phi_s_hat[valid_mask] * (4j * torch.pi * sp.UZ[valid_mask])
 
-        O_syn_hat.index_put_((target_z_indices,  target_y_indices,target_x_indices), source_values, accumulate=True)
-        weight_syn.index_put_((target_z_indices, target_y_indices, target_x_indices), torch.ones_like(source_values, device=sp.device, dtype=weight_syn.dtype), accumulate=True)
-        if i==0:
-            tifffile.imwrite('./data/test/weight.tiff', weight_syn.real.cpu().numpy())
-        
+        # 计算 8 个邻近整数坐标
+        x0, y0, z0 = torch.floor(v_fx).long(), torch.floor(v_fy).long(), torch.floor(v_fz).long()
+        x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
 
+        # 计算插值权重
+        xd, yd, zd = v_fx - x0, v_fy - y0, v_fz - z0
+
+        # 定义 8 个角的权重和位置 (Trilinear interpolation weights)
+        weights = [
+            (1-zd)*(1-yd)*(1-xd), (1-zd)*(1-yd)*xd, (1-zd)*yd*(1-xd), (1-zd)*yd*xd,
+            zd*(1-yd)*(1-xd), zd*(1-yd)*xd, zd*yd*(1-xd), zd*yd*xd
+        ]
+        coords = [
+            (z0, y0, x0), (z0, y0, x1), (z0, y1, x0), (z0, y1, x1),
+            (z1, y0, x0), (z1, y0, x1), (z1, y1, x0), (z1, y1, x1)
+        ]
+
+        # 批量累加到网格中
+        for w, (cz, cy, cx) in zip(weights, coords):
+            O_syn_hat.index_put_((cz, cy, cx), source_values * w.to(O_syn_hat.dtype), accumulate=True)
+            weight_syn.index_put_((cz, cy, cx), w.to(weight_syn.dtype), accumulate=True)
+
+    # 4. 归一化并计算逆变换
     O_syn_hat = torch.where(weight_syn > 1e-6, O_syn_hat / weight_syn, 0.0j)
     O_syn = torch.fft.ifftn(torch.fft.ifftshift(O_syn_hat))
-    
     
     return O_syn
