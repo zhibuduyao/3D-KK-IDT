@@ -188,7 +188,6 @@ class BeamPropagationMethod(torch.nn.Module):
         # 应用滤波 - 使用PyTorch FFT
         field_f = fft.fft2(field)
 
-        field_filtered_f = field_f * camera_filter
         # 数字重聚焦
         
         distance = -self.pixel_size_z* nz/2.0-defocus_distance
@@ -210,8 +209,9 @@ class BeamPropagationMethod(torch.nn.Module):
         
         
         # 应用传递函数
-        field_refocused_f = field_filtered_f * H
-        field = fft.ifft2(field_refocused_f)
+        field_refocused_f = field_f * H
+        field_filtered_f = field_refocused_f * camera_filter
+        field = fft.ifft2(field_filtered_f)
         
         return field.abs()**2
 
